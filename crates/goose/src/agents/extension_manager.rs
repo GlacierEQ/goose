@@ -1,36 +1,34 @@
 use anyhow::Result;
-use axum::http::{HeaderMap, HeaderName};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
 use futures::{future, FutureExt};
-use mcp_core::handler::require_str_parameter;
-use mcp_core::{ToolCall, ToolError};
-use rmcp::service::ClientInitializeError;
-use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
-use rmcp::transport::{
-    ConfigureCommandExt, SseClientTransport, StreamableHttpClientTransport, TokioChildProcess,
-};
+use rmcp::model::GetPromptResult;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Duration;
 use tempfile::tempdir;
-use tokio::io::AsyncReadExt;
-use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::task;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
 
 use super::extension::{ExtensionConfig, ExtensionError, ExtensionInfo, ExtensionResult, ToolInfo};
 use super::tool_execution::ToolCallResult;
-use crate::agents::extension::{Envs, ProcessExit};
+use crate::agents::extension::Envs;
 use crate::config::{Config, ExtensionConfigManager};
 use crate::prompt_template;
-use mcp_client::client::{McpClient, McpClientTrait};
-use rmcp::model::{Content, GetPromptResult, Prompt, ResourceContents, Tool};
+use mcp_client::client::{ClientCapabilities, ClientInfo, McpClient, McpClientTrait};
+use mcp_client::transport::{SseTransport, StdioTransport, StreamableHttpTransport, Transport};
+use mcp_core::{ToolCall, ErrorData};
+use rmcp::model::{Content, Prompt, Resource, ResourceContents, Tool, ErrorData, ErrorCode};
 use serde_json::Value;
+
+// By default, we set it to Jan 1, 2020 if the resource does not have a timestamp
+// This is to ensure that the resource is considered less important than resources with a more recent timestamp
+static DEFAULT_TIMESTAMP: LazyLock<DateTime<Utc>> =
+    LazyLock::new(|| Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap());
 
 type McpClientBox = Arc<Mutex<Box<dyn McpClientTrait>>>;
 
@@ -170,7 +168,7 @@ impl ExtensionManager {
                             error = %e,
                             "Failed to fetch secret from config."
                         );
-                        return Err(ExtensionError::ConfigError(format!(
+                        return Err(ExtensionError::SetupError(format!(
                             "Failed to fetch secret '{}' from config: {}",
                             key, e
                         )));
@@ -181,19 +179,20 @@ impl ExtensionManager {
             Ok(all_envs)
         }
 
-        let client: Box<dyn McpClientTrait> = match &config {
-            ExtensionConfig::Sse { uri, timeout, .. } => {
-                let transport = SseClientTransport::start(uri.to_string()).await.map_err(
-                    |transport_error| {
-                        ClientInitializeError::transport::<SseClientTransport<reqwest::Client>>(
-                            transport_error,
-                            "connect",
-                        )
-                    },
-                )?;
+        let mut client: Box<dyn McpClientTrait> = match &config {
+            ExtensionConfig::Sse {
+                uri,
+                envs,
+                env_keys,
+                timeout,
+                ..
+            } => {
+                let all_envs = merge_environments(envs, env_keys, &sanitized_name).await?;
+                let transport = SseTransport::new(uri, all_envs);
+                let handle = transport.start().await?;
                 Box::new(
                     McpClient::connect(
-                        transport,
+                        handle,
                         Duration::from_secs(
                             timeout.unwrap_or(crate::config::DEFAULT_EXTENSION_TIMEOUT),
                         ),
@@ -203,42 +202,25 @@ impl ExtensionManager {
             }
             ExtensionConfig::StreamableHttp {
                 uri,
-                timeout,
+                envs,
+                env_keys,
                 headers,
+                timeout,
                 ..
             } => {
-                let mut default_headers = HeaderMap::new();
-                for (key, value) in headers {
-                    default_headers.insert(
-                        HeaderName::try_from(key).map_err(|_| {
-                            ExtensionError::ConfigError(format!("invalid header: {}", key))
-                        })?,
-                        value.parse().map_err(|_| {
-                            ExtensionError::ConfigError(format!("invalid header value: {}", key))
-                        })?,
-                    );
-                }
-                let client = reqwest::Client::builder()
-                    .default_headers(default_headers)
-                    .build()
-                    .map_err(|_| {
-                        ExtensionError::ConfigError("could not construct http client".to_string())
-                    })?;
-                let transport = StreamableHttpClientTransport::with_client(
-                    client,
-                    StreamableHttpClientTransportConfig {
-                        uri: uri.clone().into(),
-                        ..Default::default()
-                    },
-                );
-                let client = McpClient::connect(
-                    transport,
-                    Duration::from_secs(
-                        timeout.unwrap_or(crate::config::DEFAULT_EXTENSION_TIMEOUT),
-                    ),
+                let all_envs = merge_environments(envs, env_keys, &sanitized_name).await?;
+                let transport =
+                    StreamableHttpTransport::with_headers(uri, all_envs, headers.clone());
+                let handle = transport.start().await?;
+                Box::new(
+                    McpClient::connect(
+                        handle,
+                        Duration::from_secs(
+                            timeout.unwrap_or(crate::config::DEFAULT_EXTENSION_TIMEOUT),
+                        ),
+                    )
+                    .await?,
                 )
-                .await?;
-                Box::new(client)
             }
             ExtensionConfig::Stdio {
                 cmd,
@@ -249,42 +231,17 @@ impl ExtensionManager {
                 ..
             } => {
                 let all_envs = merge_environments(envs, env_keys, &sanitized_name).await?;
-                let command = Command::new(cmd).configure(|command| {
-                    command.args(args).envs(all_envs);
-                });
-                let (transport, mut stderr) = TokioChildProcess::builder(command)
-                    .stderr(Stdio::piped())
-                    .spawn()?;
-                let mut stderr = stderr
-                    .take()
-                    .expect("should have a stderr handle because it was requested");
-
-                let stderr_task = tokio::spawn(async move {
-                    let mut all_stderr = Vec::new();
-                    stderr.read_to_end(&mut all_stderr).await?;
-                    Ok::<String, std::io::Error>(String::from_utf8_lossy(&all_stderr).into())
-                });
-
-                let client_result = McpClient::connect(
-                    transport,
-                    Duration::from_secs(
-                        timeout.unwrap_or(crate::config::DEFAULT_EXTENSION_TIMEOUT),
-                    ),
+                let transport = StdioTransport::new(cmd, args.to_vec(), all_envs);
+                let handle = transport.start().await?;
+                Box::new(
+                    McpClient::connect(
+                        handle,
+                        Duration::from_secs(
+                            timeout.unwrap_or(crate::config::DEFAULT_EXTENSION_TIMEOUT),
+                        ),
+                    )
+                    .await?,
                 )
-                .await;
-
-                let client = match client_result {
-                    Ok(client) => Ok(client),
-                    Err(error) => {
-                        let error_task_out = stderr_task.await?;
-                        Err::<McpClient, ExtensionError>(match error_task_out {
-                            Ok(stderr_content) => ProcessExit::new(stderr_content, error).into(),
-                            Err(e) => e.into(),
-                        })
-                    }
-                }?;
-
-                Box::new(client)
             }
             ExtensionConfig::Builtin {
                 name,
@@ -298,13 +255,15 @@ impl ExtensionManager {
                     .to_str()
                     .expect("should resolve executable to string path")
                     .to_string();
-
-                let transport = TokioChildProcess::new(Command::new(cmd).configure(|command| {
-                    command.arg("mcp").arg(name);
-                }))?;
+                let transport = StdioTransport::new(
+                    &cmd,
+                    vec!["mcp".to_string(), name.clone()],
+                    HashMap::new(),
+                );
+                let handle = transport.start().await?;
                 Box::new(
                     McpClient::connect(
-                        transport,
+                        handle,
                         Duration::from_secs(
                             timeout.unwrap_or(crate::config::DEFAULT_EXTENSION_TIMEOUT),
                         ),
@@ -323,20 +282,27 @@ impl ExtensionManager {
                 let file_path = temp_dir.path().join(format!("{}.py", name));
                 std::fs::write(&file_path, code)?;
 
-                let command = Command::new("uvx").configure(|command| {
-                    command.arg("--with").arg("mcp");
+                let mut args = vec![];
 
-                    dependencies.iter().flatten().for_each(|dep| {
-                        command.arg("--with").arg(dep);
-                    });
+                let mut all_deps = vec!["mcp".to_string()];
 
-                    command.arg("python").arg(file_path.to_str().unwrap());
-                });
-                let transport = TokioChildProcess::new(command)?;
+                if let Some(deps) = dependencies.as_ref() {
+                    all_deps.extend(deps.iter().cloned());
+                }
 
+                for dep in all_deps {
+                    args.push("--with".to_string());
+                    args.push(dep);
+                }
+
+                args.push("python".to_string());
+                args.push(file_path.to_str().unwrap().to_string());
+
+                let transport = StdioTransport::new("uvx", args, HashMap::new());
+                let handle = transport.start().await?;
                 let client = Box::new(
                     McpClient::connect(
-                        transport,
+                        handle,
                         Duration::from_secs(
                             timeout.unwrap_or(crate::config::DEFAULT_EXTENSION_TIMEOUT),
                         ),
@@ -351,13 +317,24 @@ impl ExtensionManager {
             _ => unreachable!(),
         };
 
-        let info = client.get_info();
-        if let Some(instructions) = info.and_then(|info| info.instructions.as_ref()) {
+        // Initialize the client with default capabilities
+        let info = ClientInfo {
+            name: "goose".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        };
+        let capabilities = ClientCapabilities::default();
+
+        let init_result = client
+            .initialize(info, capabilities)
+            .await
+            .map_err(|e| ExtensionError::Initialization(Box::new(config.clone()), e))?;
+
+        if let Some(instructions) = init_result.instructions {
             self.instructions
-                .insert(sanitized_name.clone(), instructions.clone());
+                .insert(sanitized_name.clone(), instructions);
         }
 
-        if let Some(_resources) = info.and_then(|info| info.capabilities.resources.as_ref()) {
+        if init_result.capabilities.resources.is_some() {
             self.resource_capable_extensions
                 .insert(sanitized_name.clone());
         }
@@ -452,18 +429,21 @@ impl ExtensionManager {
             task::spawn(async move {
                 let mut tools = Vec::new();
                 let client_guard = client.lock().await;
-                let mut client_tools = client_guard
-                    .list_tools(None, CancellationToken::default())
-                    .await?;
+                let mut client_tools = client_guard.list_tools(None).await?;
 
                 loop {
-                    for tool in client_tools.tools {
-                        tools.push(Tool {
-                            name: format!("{}__{}", name, tool.name).into(),
-                            description: tool.description,
-                            input_schema: tool.input_schema,
-                            annotations: tool.annotations,
-                        });
+                    for client_tool in client_tools.tools {
+                        let mut tool = Tool::new(
+                            format!("{}__{}", name, client_tool.name),
+                            client_tool.description.unwrap_or_default(),
+                            client_tool.input_schema,
+                        );
+
+                        if tool.annotations.is_some() {
+                            tool = tool.annotate(client_tool.annotations.unwrap())
+                        }
+
+                        tools.push(tool);
                     }
 
                     // Exit loop when there are no more pages
@@ -471,9 +451,7 @@ impl ExtensionManager {
                         break;
                     }
 
-                    client_tools = client_guard
-                        .list_tools(client_tools.next_cursor, CancellationToken::default())
-                        .await?;
+                    client_tools = client_guard.list_tools(client_tools.next_cursor).await?;
                 }
 
                 Ok::<Vec<Tool>, ExtensionError>(tools)
@@ -496,6 +474,43 @@ impl ExtensionManager {
         Ok(tools)
     }
 
+    /// Get client resources and their contents
+    pub async fn get_resources(&self) -> ExtensionResult<Vec<ResourceItem>> {
+        let mut result: Vec<ResourceItem> = Vec::new();
+
+        for (name, client) in &self.clients {
+            let client_guard = client.lock().await;
+            let resources = client_guard.list_resources(None).await?;
+
+            for resource in resources.resources {
+                // Skip reading the resource if it's not marked active
+                // This avoids blowing up the context with inactive resources
+                if !resource_is_active(&resource) {
+                    continue;
+                }
+
+                if let Ok(contents) = client_guard.read_resource(&resource.uri).await {
+                    for content in contents.contents {
+                        let (uri, content_str) = match content {
+                            ResourceContents::TextResourceContents { uri, text, .. } => (uri, text),
+                            ResourceContents::BlobResourceContents { uri, blob, .. } => (uri, blob),
+                        };
+
+                        result.push(ResourceItem::new(
+                            name.clone(),
+                            uri,
+                            resource.name.clone(),
+                            content_str,
+                            resource.timestamp().unwrap_or(*DEFAULT_TIMESTAMP),
+                            resource.priority().unwrap_or(0.0),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
     /// Get the extension prompt including client instructions
     pub async fn get_planning_prompt(&self, tools_info: Vec<ToolInfo>) -> String {
         let mut context: HashMap<&str, Value> = HashMap::new();
@@ -513,22 +528,22 @@ impl ExtensionManager {
     }
 
     // Function that gets executed for read_resource tool
-    pub async fn read_resource(
-        &self,
-        params: Value,
-        cancellation_token: CancellationToken,
-    ) -> Result<Vec<Content>, ToolError> {
-        let uri = require_str_parameter(&params, "uri")?;
+    pub async fn read_resource(&self, params: Value) -> Result<Vec<Content>, ErrorData> {
+        let uri = params
+            .get("uri")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ErrorData {
+            code: ErrorCode::INVALID_PARAMS,
+            message: Cow::from("Missing 'uri' parameter".to_string()),
+            data: None,
+        })?;
+
         let extension_name = params.get("extension_name").and_then(|v| v.as_str());
 
         // If extension name is provided, we can just look it up
         if extension_name.is_some() {
             let result = self
-                .read_resource_from_extension(
-                    uri,
-                    extension_name.unwrap(),
-                    cancellation_token.clone(),
-                )
+                .read_resource_from_extension(uri, extension_name.unwrap())
                 .await?;
             return Ok(result);
         }
@@ -538,9 +553,7 @@ impl ExtensionManager {
         // TODO: do we want to find if a provided uri is in multiple extensions?
         // currently it will return the first match and skip any others
         for extension_name in self.resource_capable_extensions.iter() {
-            let result = self
-                .read_resource_from_extension(uri, extension_name, cancellation_token.clone())
-                .await;
+            let result = self.read_resource_from_extension(uri, extension_name).await;
             match result {
                 Ok(result) => return Ok(result),
                 Err(_) => continue,
@@ -559,15 +572,18 @@ impl ExtensionManager {
             uri, available_extensions
         );
 
-        Err(ToolError::InvalidParameters(error_msg))
+        Err(ErrorData {
+            code: ErrorCode::INVALID_PARAMS,
+            message: Cow::from(error_msg),
+            data: None,
+        })
     }
 
     async fn read_resource_from_extension(
         &self,
         uri: &str,
         extension_name: &str,
-        cancellation_token: CancellationToken,
-    ) -> Result<Vec<Content>, ToolError> {
+    ) -> Result<Vec<Content>, ErrorData> {
         let available_extensions = self
             .clients
             .keys()
@@ -582,15 +598,20 @@ impl ExtensionManager {
         let client = self
             .clients
             .get(extension_name)
-            .ok_or(ToolError::InvalidParameters(error_msg))?;
+            .ok_or(ErrorData {
+                code: ErrorCode::INVALID_PARAMS,
+                message: Cow::from(error_msg),
+                data: None,
+        })?;
 
         let client_guard = client.lock().await;
-        let read_result = client_guard
-            .read_resource(uri, cancellation_token)
-            .await
-            .map_err(|_| {
-                ToolError::ExecutionError(format!("Could not read resource with uri: {}", uri))
-            })?;
+        let read_result = client_guard.read_resource(uri).await.map_err(|_| {
+            ErrorData {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: Cow::from(format!("Could not read resource with uri: {}", uri)),
+                data: None,
+            }
+        })?;
 
         let mut result = Vec::new();
         for content in read_result.contents {
@@ -607,21 +628,25 @@ impl ExtensionManager {
     async fn list_resources_from_extension(
         &self,
         extension_name: &str,
-        cancellation_token: CancellationToken,
-    ) -> Result<Vec<Content>, ToolError> {
+    ) -> Result<Vec<Content>, ErrorData> {
         let client = self.clients.get(extension_name).ok_or_else(|| {
-            ToolError::InvalidParameters(format!("Extension {} is not valid", extension_name))
+            ErrorData {
+                code: ErrorCode::INVALID_PARAMS,
+                message: Cow::from(format!("Extension {} is not valid", extension_name)),
+                data: None,
+            }
         })?;
 
         let client_guard = client.lock().await;
         client_guard
-            .list_resources(None, cancellation_token)
+            .list_resources(None)
             .await
             .map_err(|e| {
-                ToolError::ExecutionError(format!(
-                    "Unable to list resources for {}, {:?}",
-                    extension_name, e
-                ))
+                ErrorData {
+                    code: ErrorCode::INTERNAL_ERROR,
+                    message: Cow::from(format!("Unable to list resources for {}, {:?}", extension_name, e)),
+                    data: None,
+                }
             })
             .map(|lr| {
                 let resource_list = lr
@@ -635,18 +660,13 @@ impl ExtensionManager {
             })
     }
 
-    pub async fn list_resources(
-        &self,
-        params: Value,
-        cancellation_token: CancellationToken,
-    ) -> Result<Vec<Content>, ToolError> {
+    pub async fn list_resources(&self, params: Value) -> Result<Vec<Content>, ErrorData> {
         let extension = params.get("extension").and_then(|v| v.as_str());
 
         match extension {
             Some(extension_name) => {
                 // Handle single extension case
-                self.list_resources_from_extension(extension_name, cancellation_token)
-                    .await
+                self.list_resources_from_extension(extension_name).await
             }
             None => {
                 // Handle all extensions case using FuturesUnordered
@@ -654,10 +674,8 @@ impl ExtensionManager {
 
                 // Create futures for each resource_capable_extension
                 for extension_name in &self.resource_capable_extensions {
-                    let token = cancellation_token.clone();
                     futures.push(async move {
-                        self.list_resources_from_extension(extension_name, token)
-                            .await
+                        self.list_resources_from_extension(extension_name).await
                     });
                 }
 
@@ -692,22 +710,26 @@ impl ExtensionManager {
         }
     }
 
-    pub async fn dispatch_tool_call(
-        &self,
-        tool_call: ToolCall,
-        cancellation_token: CancellationToken,
-    ) -> Result<ToolCallResult> {
+    pub async fn dispatch_tool_call(&self, tool_call: ToolCall) -> Result<ToolCallResult> {
         // Dispatch tool call based on the prefix naming convention
         let (client_name, client) = self
             .get_client_for_tool(&tool_call.name)
-            .ok_or_else(|| ToolError::NotFound(tool_call.name.clone()))?;
+            .ok_or_else(|| ErrorData {
+                code: ErrorCode::INVALID_REQUEST,
+                message: Cow::from(tool_call.name.clone()),
+                data: None,
+            })?;
 
         // rsplit returns the iterator in reverse, tool_name is then at 0
         let tool_name = tool_call
             .name
             .strip_prefix(client_name)
             .and_then(|s| s.strip_prefix("__"))
-            .ok_or_else(|| ToolError::NotFound(tool_call.name.clone()))?
+            .ok_or_else(|| ErrorData {
+                code: ErrorCode::INVALID_REQUEST,
+                message: Cow::from(tool_call.name.clone()),
+                data: None,
+            })?
             .to_string();
 
         let arguments = tool_call.arguments.clone();
@@ -717,10 +739,14 @@ impl ExtensionManager {
         let fut = async move {
             let client_guard = client.lock().await;
             client_guard
-                .call_tool(&tool_name, arguments, cancellation_token)
+                .call_tool(&tool_name, arguments)
                 .await
                 .map(|call| call.content)
-                .map_err(|e| ToolError::ExecutionError(e.to_string()))
+                .map_err(|e| ErrorData {
+                    code: ErrorCode::INTERNAL_ERROR,
+                    message: Cow::from(e.to_string()),
+                    data: None,
+                })
         };
 
         Ok(ToolCallResult {
@@ -732,38 +758,37 @@ impl ExtensionManager {
     pub async fn list_prompts_from_extension(
         &self,
         extension_name: &str,
-        cancellation_token: CancellationToken,
-    ) -> Result<Vec<Prompt>, ToolError> {
+    ) -> Result<Vec<Prompt>, ErrorData> {
         let client = self.clients.get(extension_name).ok_or_else(|| {
-            ToolError::InvalidParameters(format!("Extension {} is not valid", extension_name))
+            ErrorData {
+                code: ErrorCode::INVALID_PARAMS,
+                message: Cow::from(format!("Extension {} is not valid", extension_name)),
+                data: None,
+            }
         })?;
 
         let client_guard = client.lock().await;
         client_guard
-            .list_prompts(None, cancellation_token)
+            .list_prompts(None)
             .await
             .map_err(|e| {
-                ToolError::ExecutionError(format!(
-                    "Unable to list prompts for {}, {:?}",
-                    extension_name, e
-                ))
+                ErrorData {
+                    code: ErrorCode::INTERNAL_ERROR,
+                    message: Cow::from(format!("Unable to list prompts for {}, {:?}", extension_name, e)),
+                    data: None,
+                }
             })
             .map(|lp| lp.prompts)
     }
 
-    pub async fn list_prompts(
-        &self,
-        cancellation_token: CancellationToken,
-    ) -> Result<HashMap<String, Vec<Prompt>>, ToolError> {
+    pub async fn list_prompts(&self) -> Result<HashMap<String, Vec<Prompt>>, ErrorData> {
         let mut futures = FuturesUnordered::new();
 
         for extension_name in self.clients.keys() {
-            let token = cancellation_token.clone();
             futures.push(async move {
                 (
                     extension_name,
-                    self.list_prompts_from_extension(extension_name, token)
-                        .await,
+                    self.list_prompts_from_extension(extension_name).await,
                 )
             });
         }
@@ -803,7 +828,6 @@ impl ExtensionManager {
         extension_name: &str,
         name: &str,
         arguments: Value,
-        cancellation_token: CancellationToken,
     ) -> Result<GetPromptResult> {
         let client = self
             .clients
@@ -812,12 +836,12 @@ impl ExtensionManager {
 
         let client_guard = client.lock().await;
         client_guard
-            .get_prompt(name, arguments, cancellation_token)
+            .get_prompt(name, arguments)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to get prompt: {}", e))
     }
 
-    pub async fn search_available_extensions(&self) -> Result<Vec<Content>, ToolError> {
+    pub async fn search_available_extensions(&self) -> Result<Vec<Content>, ErrorData> {
         let mut output_parts = vec![];
 
         // First get disabled extensions from current config
@@ -891,19 +915,20 @@ impl ExtensionManager {
     }
 }
 
+fn resource_is_active(resource: &Resource) -> bool {
+    resource.priority().is_some_and(|p| (p - 1.0).abs() < 1e-6)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use mcp_client::client::Error;
     use mcp_client::client::McpClientTrait;
-    use rmcp::model::CallToolResult;
-    use rmcp::model::InitializeResult;
-
-    use rmcp::model::ListPromptsResult;
-    use rmcp::model::ListResourcesResult;
-    use rmcp::model::ListToolsResult;
-    use rmcp::model::ReadResourceResult;
-    use rmcp::model::ServerNotification;
+    use mcp_core::protocol::{
+        CallToolResult, InitializeResult, ListPromptsResult, ListResourcesResult, ListToolsResult,
+        ReadResourceResult,
+    };
+    use rmcp::model::{GetPromptResult, ServerNotification, ErrorData, ErrorCode};
     use serde_json::json;
     use tokio::sync::mpsc;
 
@@ -911,64 +936,52 @@ mod tests {
 
     #[async_trait::async_trait]
     impl McpClientTrait for MockClient {
-        fn get_info(&self) -> Option<&InitializeResult> {
-            None
+        async fn initialize(
+            &mut self,
+            _info: ClientInfo,
+            _capabilities: ClientCapabilities,
+        ) -> Result<InitializeResult, Error> {
+            Err(Error::NotInitialized)
         }
 
         async fn list_resources(
             &self,
             _next_cursor: Option<String>,
-            _cancellation_token: CancellationToken,
         ) -> Result<ListResourcesResult, Error> {
-            Err(Error::TransportClosed)
+            Err(Error::NotInitialized)
         }
 
-        async fn read_resource(
-            &self,
-            _uri: &str,
-            _cancellation_token: CancellationToken,
-        ) -> Result<ReadResourceResult, Error> {
-            Err(Error::TransportClosed)
+        async fn read_resource(&self, _uri: &str) -> Result<ReadResourceResult, Error> {
+            Err(Error::NotInitialized)
         }
 
-        async fn list_tools(
-            &self,
-            _next_cursor: Option<String>,
-            _cancellation_token: CancellationToken,
-        ) -> Result<ListToolsResult, Error> {
-            Err(Error::TransportClosed)
+        async fn list_tools(&self, _next_cursor: Option<String>) -> Result<ListToolsResult, Error> {
+            Err(Error::NotInitialized)
         }
 
-        async fn call_tool(
-            &self,
-            name: &str,
-            _arguments: Value,
-            _cancellation_token: CancellationToken,
-        ) -> Result<CallToolResult, Error> {
+        async fn call_tool(&self, name: &str, _arguments: Value) -> Result<CallToolResult, Error> {
             match name {
                 "tool" | "test__tool" => Ok(CallToolResult {
                     content: vec![],
                     is_error: None,
                 }),
-                _ => Err(Error::TransportClosed),
+                _ => Err(Error::NotInitialized),
             }
         }
 
         async fn list_prompts(
             &self,
             _next_cursor: Option<String>,
-            _cancellation_token: CancellationToken,
         ) -> Result<ListPromptsResult, Error> {
-            Err(Error::TransportClosed)
+            Err(Error::NotInitialized)
         }
 
         async fn get_prompt(
             &self,
             _name: &str,
             _arguments: Value,
-            _cancellation_token: CancellationToken,
         ) -> Result<GetPromptResult, Error> {
-            Err(Error::TransportClosed)
+            Err(Error::NotInitialized)
         }
 
         async fn subscribe(&self) -> mpsc::Receiver<ServerNotification> {
@@ -1050,9 +1063,7 @@ mod tests {
             arguments: json!({}),
         };
 
-        let result = extension_manager
-            .dispatch_tool_call(tool_call, CancellationToken::default())
-            .await;
+        let result = extension_manager.dispatch_tool_call(tool_call).await;
         assert!(result.is_ok());
 
         let tool_call = ToolCall {
@@ -1060,9 +1071,7 @@ mod tests {
             arguments: json!({}),
         };
 
-        let result = extension_manager
-            .dispatch_tool_call(tool_call, CancellationToken::default())
-            .await;
+        let result = extension_manager.dispatch_tool_call(tool_call).await;
         assert!(result.is_ok());
 
         // verify a multiple underscores dispatch
@@ -1071,9 +1080,7 @@ mod tests {
             arguments: json!({}),
         };
 
-        let result = extension_manager
-            .dispatch_tool_call(tool_call, CancellationToken::default())
-            .await;
+        let result = extension_manager.dispatch_tool_call(tool_call).await;
         assert!(result.is_ok());
 
         // Test unicode in tool name, "client 🚀" should become "client_"
@@ -1082,9 +1089,7 @@ mod tests {
             arguments: json!({}),
         };
 
-        let result = extension_manager
-            .dispatch_tool_call(tool_call, CancellationToken::default())
-            .await;
+        let result = extension_manager.dispatch_tool_call(tool_call).await;
         assert!(result.is_ok());
 
         let tool_call = ToolCall {
@@ -1092,29 +1097,31 @@ mod tests {
             arguments: json!({}),
         };
 
-        let result = extension_manager
-            .dispatch_tool_call(tool_call, CancellationToken::default())
-            .await;
+        let result = extension_manager.dispatch_tool_call(tool_call).await;
         assert!(result.is_ok());
 
-        // this should error out, specifically for an ToolError::ExecutionError
+        // this should error out, specifically for an ErrorData::ExecutionError
         let invalid_tool_call = ToolCall {
             name: "client___tools".to_string(),
             arguments: json!({}),
         };
 
         let result = extension_manager
-            .dispatch_tool_call(invalid_tool_call, CancellationToken::default())
+            .dispatch_tool_call(invalid_tool_call)
             .await
             .unwrap()
             .result
             .await;
         assert!(matches!(
             result.err().unwrap(),
-            ToolError::ExecutionError(_)
+            ErrorData {
+            code: ErrorCode::INTERNAL_ERROR,
+            message: Cow::from(_),
+            data: None,
+        }
         ));
 
-        // this should error out, specifically with an ToolError::NotFound
+        // this should error out, specifically with an ErrorData::NotFound
         // this client doesn't exist
         let invalid_tool_call = ToolCall {
             name: "_client__tools".to_string(),
@@ -1122,13 +1129,17 @@ mod tests {
         };
 
         let result = extension_manager
-            .dispatch_tool_call(invalid_tool_call, CancellationToken::default())
+            .dispatch_tool_call(invalid_tool_call)
             .await;
         if let Err(err) = result {
-            let tool_err = err.downcast_ref::<ToolError>().expect("Expected ToolError");
-            assert!(matches!(tool_err, ToolError::NotFound(_)));
+            let tool_err = err.downcast_ref::<ErrorData>().expect("Expected ErrorData");
+            assert!(matches!(tool_err, ErrorData {
+            code: ErrorCode::INVALID_REQUEST,
+            message: Cow::from(_),
+            data: None,
+        }));
         } else {
-            panic!("Expected ToolError::NotFound");
+            panic!("Expected ErrorData::NotFound");
         }
     }
 }
