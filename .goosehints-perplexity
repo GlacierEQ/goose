@@ -1,0 +1,91 @@
+# Goose Hints for Perplexity Enhancement Integration
+
+# AUTONOMOUS LEGAL DOCUMENT GENERATION
+# Generate court-ready motions in 60 seconds
+goose run "Generate TRO motion for Hawaii Family Court with evidence from email.pdf"
+
+# SMART REPOSITORY DEPLOYMENT  
+# AI-powered repo selection and deployment
+goose run "Deploy legal-doc-gundam to my top 3 legal repos"
+
+# PERSISTENT MEMORY
+# Save and recall deployment patterns
+goose run "Remember this deployment pattern as 'triple-legal'"
+goose run "Execute deployment using 'triple-legal' pattern"
+
+# REPOSITORY INTELLIGENCE
+# Complete GitHub repo mapping and analysis
+goose run "Scan all my repos and show legal automation candidates"
+goose run "Which repos should I enrich next?"
+
+# LEARNING FROM HISTORY
+# Analyze past patterns and optimize
+goose run "What deployment patterns have worked best?"
+goose run "Show my learning progress"
+
+# AUTONOMOUS WORKFLOWS
+# Complex multi-step operations
+goose run "Execute workflow: scan repos → suggest targets → deploy to top 3"
+
+# LEGAL TEMPLATE LIBRARY
+# List and use court templates
+goose run "Show me all legal templates"
+goose run "Generate custody motion for Hawaii using template"
+
+# SELF-IMPROVING CODE GENERATION
+# Generate production code with learning
+goose run "Generate evidence registry system with enterprise quality"
+goose run "Refactor this code using learned best practices"
+
+# MULTI-SESSION LEARNING EXAMPLES
+
+# Session 1 - First deployment
+goose run "Deploy legal automation to hawaii-family-court-legal-automation"
+# → Pattern saved automatically
+
+# Session 2 - Recall and execute
+goose run "Deploy like last time"
+# → Goose recalls pattern, executes identically
+
+# Session 10 - Expert level
+goose run "What's the optimal legal automation deployment strategy?"
+# → Goose analyzes 10 sessions, recommends best approach
+
+# MEMORY OPERATIONS
+
+# Save custom preference
+goose run "Save my preference: always use main branch for deployments"
+
+# Recall specific pattern
+goose run "Show me the triple-deployment pattern details"
+
+# REPOSITORY INTELLIGENCE QUERIES
+
+# Deep repo analysis
+goose run "Analyze hawaii-family-court-legal-automation repo"
+
+# Dependency mapping
+goose run "Show me which repos depend on FILEBOSS"
+
+# LEGAL DOCUMENT WORKFLOWS
+
+# Complete motion generation
+goose run "Generate TRO motion with: facts from notes.txt, evidence from exhibit-a.pdf, court is Hawaii Family"
+
+# Validate existing document
+goose run "Validate motion.tex against Hawaii Family Court requirements"
+
+# AUTONOMOUS DEPLOYMENT WORKFLOWS
+
+# Full auto deployment
+goose run "Scan repos, identify legal automation candidates, deploy to top 5, save pattern"
+
+# Learning-enhanced deployment
+goose run "Deploy using best practices learned from past 10 deployments"
+
+# ENHANCEMENT STATS
+
+# Check learning progress
+goose run "Show enhancement statistics"
+goose run "How many patterns have I learned?"
+goose run "What's my deployment success rate?"
